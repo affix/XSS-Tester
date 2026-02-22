@@ -86,6 +86,9 @@ class Spider:
         self.base_domain: str = parsed.netloc
 
         self._visited: set[str] = set()
+        # Tracks (netloc, path, frozenset(param_names)) to avoid re-crawling
+        # URLs that differ only in GET parameter values.
+        self._visited_param_sigs: set[tuple] = set()
         # BFS queue of (normalised_url, depth)
         self._queue: list[tuple[str, int]] = []
 
@@ -120,7 +123,13 @@ class Spider:
             if self._should_skip(norm_url):
                 continue
 
+            param_sig = self._param_signature(norm_url)
+            if param_sig in self._visited_param_sigs:
+                logger.debug("Skipping %s — same path+params already crawled", norm_url)
+                continue
+
             self._visited.add(norm_url)
+            self._visited_param_sigs.add(param_sig)
 
             async with self.semaphore:
                 page_data = await self._visit_page(norm_url, depth)
@@ -686,6 +695,20 @@ class Spider:
     # ------------------------------------------------------------------
     # URL helpers
     # ------------------------------------------------------------------
+
+    def _param_signature(self, url: str) -> tuple:
+        """Return ``(netloc, path, frozenset(param_names))`` for *url*.
+
+        Two URLs with the same path and the same set of GET parameter *names*
+        but different *values* will produce an identical signature, allowing
+        the crawler to skip re-crawling them.
+        """
+        try:
+            parsed = urlparse(url)
+            names = frozenset(parse_qs(parsed.query, keep_blank_values=True).keys())
+            return (parsed.netloc, parsed.path, names)
+        except Exception:
+            return (url, "", frozenset())
 
     def _normalize_url(self, url: str) -> str:
         """Return a canonical, fragment-free version of *url*, or ``""`` on failure."""
