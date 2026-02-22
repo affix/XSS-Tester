@@ -201,28 +201,38 @@ class Spider:
                 )
                 return None
 
-            # Some applications (e.g. Dojo/Struts apps) use a single catch-all
-            # URL (e.g. IndexAction.action) for all views via server-side
-            # forwarding.  When the browser URL after navigation is already
-            # recorded as visited but differs from what was requested, every
-            # distinct page would otherwise collapse to the same URL entry,
-            # breaking both deduplication and payload re-navigation.
-            # In that case prefer the originally requested href as the page
-            # identity so each action URL is stored and re-navigable on its own.
-            norm_browser = self._normalize_url(browser_url)
-            if norm_browser in self._visited and norm_browser != self._normalize_url(url):
-                final_url = url
-                logger.debug(
-                    "Catch-all URL detected (%s) — using requested href as page identity: %s",
-                    browser_url,
-                    url,
-                )
-            else:
-                final_url = browser_url
-                if browser_url != url:
+            # Decide the canonical URL for this page.
+            #
+            # Some apps (Dojo/Struts/.action frameworks) use a single catch-all
+            # URL (e.g. IndexAction.action) for every view via server-side
+            # forwarding. The browser URL changes path but stays on the same
+            # scheme+host. Treating that as a real redirect would collapse every
+            # distinct action URL into the same page_data entry, breaking both
+            # deduplication and payload re-navigation.
+            #
+            # Rule: when the URL change is same-scheme + same-host (path only),
+            # prefer the originally requested href as the page identity. Only
+            # follow the browser URL when the scheme or host actually changes
+            # (e.g. http→https upgrades, cross-domain redirects).
+            if browser_url != url:
+                p_req = urlparse(url)
+                p_got = urlparse(browser_url)
+                if p_req.scheme == p_got.scheme and p_req.netloc == p_got.netloc:
+                    final_url = url
+                    logger.debug(
+                        "Same-host forward (%s -> %s) — using requested URL as page identity",
+                        url,
+                        browser_url,
+                    )
+                else:
+                    final_url = browser_url
                     logger.debug("Redirect followed: %s -> %s", url, browser_url)
+            else:
+                final_url = url
 
             page_data = PageData(url=final_url, depth=depth)
+            await self._trigger_layout(page)
+            await self._click_tabs(page)
             page_data.inputs = await self._extract_inputs(page)
             page_data.links = await self._extract_links(page)
             # Use final_url so params added by the redirect (e.g. ?q=&tr=) are captured
@@ -251,6 +261,9 @@ class Spider:
         """Return all testable ``<input>``, ``<textarea>``, and ``<select>`` elements.
 
         Processes form-bound fields first, then standalone (orphaned) inputs.
+        Elements that are disabled, read-only, or otherwise non-editable are
+        skipped — Dojo and similar widget frameworks inject hidden/readonly
+        internal inputs alongside the real editable ones.
         """
         inputs: list[InputField] = []
         _skip_types = {"submit", "button", "reset", "image", "file", "hidden"}
@@ -276,6 +289,13 @@ class Spider:
                     if itype in _skip_types:
                         continue
 
+                    # Skip disabled / readonly elements — they cannot be filled
+                    try:
+                        if not await el.is_editable():
+                            continue
+                    except PlaywrightError:
+                        continue
+
                     name = await el.get_attribute("name")
                     el_id = await el.get_attribute("id")
                     selector = self._build_selector(tag, name, el_id, form_idx)
@@ -299,6 +319,13 @@ class Spider:
                 tag = (await el.evaluate("e => e.tagName")).lower()
                 itype = (await el.get_attribute("type") or "text").lower()
                 if itype in _skip_types:
+                    continue
+
+                # Skip disabled / readonly elements
+                try:
+                    if not await el.is_editable():
+                        continue
+                except PlaywrightError:
                     continue
 
                 name = await el.get_attribute("name")
@@ -548,6 +575,69 @@ class Spider:
                     )
 
         return raw
+
+    async def _trigger_layout(self, page: Page) -> None:
+        """Fire a window resize event and call each Dojo widget's resize().
+
+        Dojo layout widgets (BorderContainer, ContentPane, TabContainer, …)
+        calculate their dimensions lazily on ``window.resize``.  Playwright
+        opens a fixed viewport and never fires one, so nested panes — and the
+        inputs inside them — remain invisible and undetectable until a resize
+        occurs.
+        """
+        try:
+            await page.evaluate("""
+                () => {
+                    window.dispatchEvent(new Event('resize'));
+                    if (window.dijit && window.dijit.registry) {
+                        window.dijit.registry.forEach(w => {
+                            if (typeof w.resize === 'function') {
+                                try { w.resize(); } catch (_) {}
+                            }
+                        });
+                    }
+                }
+            """)
+            await page.wait_for_timeout(300)
+        except PlaywrightError:
+            pass
+
+    async def _click_tabs(self, page: Page) -> None:
+        """Click every tab trigger on the page to reveal hidden tab panels.
+
+        Widget frameworks (Dojo TabContainer, jQuery UI Tabs, Bootstrap Tabs,
+        ARIA tab lists, etc.) hide content in panels that are only rendered
+        once their tab is activated.  Clicking each tab before extracting
+        inputs ensures that all hidden fields are in the DOM and reachable.
+
+        Uses a JS ``el.click()`` unconditionally — Playwright's own click()
+        fails for elements that are outside the viewport or covered by Dojo's
+        ``position:absolute`` layout layers.  Deduplication by visible text
+        prevents the same logical tab from being clicked twice.
+        """
+        selectors = [
+            "[role='tablist'] [role='tab']",
+            "[role='tab']",
+        ]
+        clicked: set[str] = set()
+
+        for sel in selectors:
+            try:
+                tabs = await page.query_selector_all(sel)
+            except PlaywrightError as exc:
+                logger.debug("Tab query for '%s' failed: %s", sel, exc)
+                continue
+
+            for tab in tabs:
+                try:
+                    label = ((await tab.text_content()) or "").strip()[:80]
+                    if label in clicked:
+                        continue
+                    clicked.add(label)
+                    await tab.evaluate("el => el.click()")
+                    await page.wait_for_timeout(300)
+                except PlaywrightError as exc:
+                    logger.debug("Error clicking tab '%s': %s", label, exc)
 
     # ------------------------------------------------------------------
     # URL parameter extraction

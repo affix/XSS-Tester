@@ -16,14 +16,16 @@ proxying, out-of-band (OOB) detection via Interactsh, and rich console output.
 | SPA support | Waits for `networkidle` before scraping each page |
 | Redirect following | Follows same-domain server redirects and captures GET params added by the redirect |
 | Input discovery | Form inputs, standalone inputs, URL query parameters (from crawled pages, redirects, and discovered links) |
+| JavaScript app support | Dojo, jQuery UI, Bootstrap — dropdown menus expanded, tab panels revealed, layout engine triggered |
 | Detection | Alert dialogs · DOM mutation (`window.__xss`) · Interactsh OOB · Stored XSS re-crawl |
 | Selective disabling | Any detection method can be disabled individually |
-| Authentication | Form-based JSON script · raw cookie string |
+| Authentication | Simple JSON · step-based JSON · Python script · raw cookie string |
 | Proxy | Pass-through to Burp / mitmproxy with TLS bypass |
 | Reporting | Live rich console output + JSON report file |
 | Concurrency | Semaphore-gated parallel injection tasks |
 | OOB threading | Interactsh wait + poll runs in a background thread; SIGINT aborts the wait early |
 | Graceful exit | CTRL+C saves partial findings before quitting |
+| GET-params-only mode | Skip all form injection and test URL parameters only |
 
 ---
 
@@ -92,7 +94,7 @@ usage: xss-tester [-h] --base-url URL [--scope PATH]
                   [--proxy URL] [--proxy-ca FILE]
                   [--interactsh-url URL] [--payloads FILE]
                   [--oob-wait SECS] [--disable-detection METHOD [METHOD ...]]
-                  [--re-crawl]
+                  [--re-crawl] [--get-params-only]
                   [--max-pages N] [--max-depth N] [--delay SECS] [--concurrency N]
                   [--output FILE] [--verbose]
                   [--headless | --no-headless]
@@ -111,6 +113,7 @@ usage: xss-tester [-h] --base-url URL [--scope PATH]
 | `--oob-wait` | `15` | Seconds to wait after all injections before polling Interactsh for callbacks |
 | `--disable-detection` | — | Disable one or more detection methods: `alert-dialog`, `dom-mutation`, `interactsh-oob` |
 | `--re-crawl` | off | After injection, re-visit every crawled page to detect stored XSS |
+| `--get-params-only` | off | Skip all form injection and only test URL GET parameters |
 | `--max-pages` | `100` | Maximum pages to crawl |
 | `--max-depth` | `3` | Maximum BFS depth |
 | `--delay` | `0` | Seconds to sleep between requests |

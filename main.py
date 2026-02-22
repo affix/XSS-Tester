@@ -162,6 +162,12 @@ Examples
             "Runs concurrently with the OOB wait period."
         ),
     )
+    detect.add_argument(
+        "--get-params-only",
+        action="store_true",
+        default=False,
+        help="Only test URL GET parameters — skip all form input injection.",
+    )
 
     # ── Crawl limits ──────────────────────────────────────────────────────────
     limits = parser.add_argument_group("crawl limits")
@@ -329,6 +335,8 @@ async def run(args: argparse.Namespace) -> None:
             reporter.log_info(
                 f"Disabled:    [yellow]{', '.join(sorted(args.disabled_detections))}[/yellow]"
             )
+        if args.get_params_only:
+            reporter.log_info("Mode:        [yellow]GET params only[/yellow]")
 
         # ── Step 3: crawl ─────────────────────────────────────────────────────
         spider = Spider(
@@ -362,6 +370,7 @@ async def run(args: argparse.Namespace) -> None:
                 shutdown_event=shutdown_event,
                 disabled_detections=set(args.disabled_detections),
                 oob_wait=args.oob_wait,
+                get_params_only=args.get_params_only,
             )
             await tester.test_all(pages)
 

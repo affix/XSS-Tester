@@ -66,6 +66,7 @@ class XSSTester:
         shutdown_event: asyncio.Event,
         disabled_detections: Optional[set[str]] = None,
         oob_wait: float = 15.0,
+        get_params_only: bool = False,
     ) -> None:
         self.context = context
         self.payloads_file = payloads_file
@@ -77,6 +78,7 @@ class XSSTester:
         self.shutdown_event = shutdown_event
         self._disabled: frozenset[str] = frozenset(disabled_detections or ())
         self._oob_wait = oob_wait
+        self._get_params_only = get_params_only
 
         self._payloads: list[str] = []
         self._interactsh: Optional[InteractshClient] = None
@@ -114,20 +116,21 @@ class XSSTester:
 
         tasks: list[asyncio.Task] = []
         for page_data in pages:
-            for inp in page_data.inputs:
-                for payload in self._payloads:
-                    test_id = _new_test_id()
-                    self.reporter.inputs_tested += 1
-                    tasks.append(
-                        asyncio.ensure_future(
-                            self._inject_into_input(
-                                page_url=page_data.url,
-                                inp=inp,
-                                payload=payload,
-                                test_id=test_id,
+            if not self._get_params_only:
+                for inp in page_data.inputs:
+                    for payload in self._payloads:
+                        test_id = _new_test_id()
+                        self.reporter.inputs_tested += 1
+                        tasks.append(
+                            asyncio.ensure_future(
+                                self._inject_into_input(
+                                    page_url=page_data.url,
+                                    inp=inp,
+                                    payload=payload,
+                                    test_id=test_id,
+                                )
                             )
                         )
-                    )
 
             for url_param in page_data.url_params:
                 for payload in self._payloads:
@@ -242,6 +245,16 @@ class XSSTester:
                 page.on("dialog", _on_dialog)
                 await page.goto(page_url, wait_until="networkidle", timeout=30_000)
 
+            # Trigger layout recalculation for Dojo BorderContainer / ContentPane
+            # widgets.  They calculate pane sizes on window resize events; without
+            # one, buttons inside nested panes remain invisible and unclickable
+            # even though their DOM nodes exist.  Also call each widget's resize()
+            # directly as belt-and-suspenders.
+            await self._trigger_layout(page)
+
+            # Reveal content hidden behind tab panels before locating the input.
+            await self._reveal_element(page, inp.selector)
+
             # Locate input
             try:
                 element = await page.wait_for_selector(inp.selector, timeout=5_000)
@@ -252,32 +265,82 @@ class XSSTester:
             if not element:
                 return
 
-            # Fill input with payload
+            # Fill input with payload.
+            # Guard against elements that became non-editable after page load
+            # (e.g. Dojo widget internals that were not filtered at crawl time).
             try:
-                await element.fill(payload)
+                if not await element.is_editable():
+                    logger.debug("Input not editable, skipping: %s", inp.selector)
+                    return
+            except PlaywrightError:
+                return
+
+            # Capture the current value so it can be restored if client-side
+            # validation rejects the payload (aria-invalid → "true").
+            try:
+                prev_val = await element.evaluate("el => el.value")
+            except PlaywrightError:
+                prev_val = ""
+
+            try:
+                await element.fill(payload, timeout=5_000)
             except PlaywrightError as exc:
                 logger.debug("Could not fill %s: %s", inp.selector, exc)
                 return
+
+            # If client-side validation fires and marks the field invalid the
+            # server will never see the payload — restore the original value
+            # and skip this injection.
+            try:
+                if await element.get_attribute("aria-invalid") == "true":
+                    logger.debug("aria-invalid after fill — restoring and skipping: %s", inp.selector)
+                    try:
+                        await element.fill(prev_val, timeout=3_000)
+                    except PlaywrightError:
+                        pass
+                    return
+            except PlaywrightError:
+                pass
 
             # Fill sibling inputs with dummy values to avoid validation errors
             if inp.form_selector:
                 await self._fill_sibling_inputs(page, inp)
 
-            # Submit the form (or press Enter on standalone inputs)
-            if inp.form_selector and inp.form_action:
-                try:
-                    submit = await page.query_selector(
-                        f"{inp.form_selector} [type=submit], "
-                        f"{inp.form_selector} button[type=submit], "
-                        f"{inp.form_selector} button:not([type])"
-                    )
-                    if submit:
-                        await submit.click()
-                    else:
-                        await element.press("Enter")
-                    await page.wait_for_load_state("networkidle", timeout=10_000)
-                except PlaywrightError:
-                    pass
+            # Submit: press Enter on the filled field, then also click the first
+            # Save/Submit button found via text search.  Both run unconditionally
+            # so whichever the app responds to will trigger the submission.
+            try:
+                await element.press("Enter")
+            except PlaywrightError:
+                pass
+
+            try:
+                clicked = await page.evaluate("""
+                    () => {
+                        const kw = /\\b(save|submit|ok|apply|confirm|update|create|add)\\b/i;
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null
+                        );
+                        let node;
+                        while ((node = walker.nextNode())) {
+                            const text = node.textContent.trim();
+                            if (text.length > 0 && text.length < 50 && kw.test(text)) {
+                                node.parentElement.click();
+                                return text;
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                logger.debug("Text-based submit click: %s", clicked or "no match")
+            except PlaywrightError as exc:
+                logger.debug("Submit JS click failed: %s", exc)
+
+            # Always wait for network idle regardless of which submit path ran.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+            except PlaywrightError:
+                pass
 
             detection = await self._detect(page, dialog_triggered, test_id)
             if detection:
@@ -627,31 +690,205 @@ class XSSTester:
         new_query = urlencode(qs, doseq=True)
         return urlunparse(parsed._replace(query=new_query))
 
+    async def _find_submit_button(self, page: Page, form_selector: Optional[str]):
+        """Return a clickable submit button, or *None*.
+
+        Search order:
+
+        1. Standard ``[type=submit]`` / ``button[type=submit]`` / typeless
+           ``<button>`` **inside** the form (skipped when *form_selector* is
+           ``None``).
+        2. Dojo ``dijitButton`` widgets **inside** the form — these render as
+           ``<span role="button">`` (not ``<button type="submit">``), so they
+           are invisible to selector 1.  Also skipped when no form.
+        3. Page-wide keyword search across all interactive elements whose
+           visible text contains a submit-indicating word: ``save``,
+           ``submit``, ``ok``, ``apply``, ``confirm``, ``update``, ``create``,
+           ``add``.  This is the primary path for Dojo apps where action
+           buttons live in a separate ``ContentPane`` outside ``<form>``.
+        """
+        # 1 & 2 — within the form (only when a form selector is known)
+        if form_selector:
+            within_form = [
+                f"{form_selector} [type=submit]",
+                f"{form_selector} button[type=submit]",
+                f"{form_selector} button:not([type])",
+                # Dojo: clickable span with role="button" inside .dijitButtonNode
+                f"{form_selector} .dijitButtonContents[role='button']",
+                f"{form_selector} .dijitButtonNode",
+                f"{form_selector} .dijitButton button",
+            ]
+            for sel in within_form:
+                try:
+                    el = await page.query_selector(sel)
+                    if el:
+                        return el
+                except PlaywrightError:
+                    continue
+
+        # 3 — page-wide keyword search
+        # Includes Dojo's span[role='button'] (.dijitButtonContents) which is the
+        # actual interactive target — not the hidden dijitOffScreen <input>.
+        _keywords = {"save", "submit", "ok", "apply", "confirm", "update", "create", "add"}
+        candidates_sel = (
+            "button, input[type=submit], "
+            "[role='button']:not([aria-disabled='true']), "
+            ".dijitButtonNode"
+        )
+        try:
+            candidates = await page.query_selector_all(candidates_sel)
+            for el in candidates:
+                try:
+                    text = ((await el.text_content()) or "").strip().lower()
+                    val = (await el.get_attribute("value") or "").strip().lower()
+                    if any(kw in text or kw in val for kw in _keywords):
+                        return el
+                except PlaywrightError:
+                    continue
+        except PlaywrightError:
+            pass
+
+        return None
+
+    async def _trigger_layout(self, page: Page) -> None:
+        """Fire a window resize event and call each Dojo widget's resize().
+
+        Dojo layout widgets (BorderContainer, ContentPane, TabContainer, …)
+        calculate their dimensions lazily on ``window.resize``.  Playwright
+        opens a fixed viewport and never fires one, so nested panes — and the
+        action buttons inside them — stay invisible until a resize occurs.
+        Dispatching the event here replicates what a manual browser resize does.
+        """
+        try:
+            await page.evaluate("""
+                () => {
+                    window.dispatchEvent(new Event('resize'));
+                    if (window.dijit && window.dijit.registry) {
+                        window.dijit.registry.forEach(w => {
+                            if (typeof w.resize === 'function') {
+                                try { w.resize(); } catch (_) {}
+                            }
+                        });
+                    }
+                }
+            """)
+            await page.wait_for_timeout(300)
+        except PlaywrightError:
+            pass
+
+    async def _reveal_element(self, page: Page, selector: str) -> None:
+        """Click tabs one at a time until *selector* is visible on the page.
+
+        Dojo (and other widget frameworks) keep hidden tab-panel content in
+        the DOM but set ``display:none`` on inactive panels.
+        ``query_selector`` finds such elements immediately, but they cannot
+        be filled until their panel is active.  We therefore check
+        ``is_visible()`` — not just DOM presence — and only stop clicking
+        once the element is truly accessible.
+
+        Stops as soon as the target is visible so the correct tab stays
+        active for filling and submission.
+        """
+        # Check whether the element is already visible.
+        try:
+            el = await page.query_selector(selector)
+            if el and await el.is_visible():
+                return
+        except PlaywrightError:
+            return  # Can't inspect — skip tab revelation.
+
+        tab_selectors = [
+            "[role='tablist'] [role='tab']",
+            "[role='tab']",
+        ]
+        clicked: set[str] = set()
+
+        for sel in tab_selectors:
+            try:
+                tabs = await page.query_selector_all(sel)
+            except PlaywrightError as exc:
+                logger.debug("Tab query for '%s' failed: %s", sel, exc)
+                continue
+
+            for tab in tabs:
+                try:
+                    label = ((await tab.text_content()) or "").strip()[:80]
+                    if label in clicked:
+                        continue
+                    clicked.add(label)
+                    await tab.evaluate("el => el.click()")
+                    await page.wait_for_timeout(300)
+                    # Stop only once the element is actually visible.
+                    el = await page.query_selector(selector)
+                    if el and await el.is_visible():
+                        return
+                except PlaywrightError as exc:
+                    logger.debug("Error clicking tab '%s': %s", label, exc)
+
     async def _fill_sibling_inputs(self, page: Page, skip: InputField) -> None:
         """Fill all other inputs within the same form with a dummy value.
 
-        Prevents server-side validation from blocking our payload submission.
+        Runs entirely inside a single ``page.evaluate`` call so there is no
+        per-element Playwright IPC overhead.  All filtering (disabled, readonly,
+        ARIA-managed, combobox ancestry) and aria-invalid restore logic happen
+        in the browser process and complete in one round-trip.
         """
         if not skip.form_selector:
             return
         try:
-            siblings = await page.query_selector_all(
-                f"{skip.form_selector} input:not([type=submit]):not([type=button])"
-                f":not([type=reset]):not([type=hidden]):not([type=file]), "
-                f"{skip.form_selector} textarea"
+            await page.evaluate(
+                """
+                ([formSel, skipSel]) => {
+                    const form = document.querySelector(formSel);
+                    if (!form) return;
+
+                    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+                    const rand = () => Array.from(
+                        {length: 8},
+                        () => chars[Math.floor(Math.random() * chars.length)]
+                    ).join('');
+
+                    const fields = form.querySelectorAll(
+                        'input:not([type=submit]):not([type=button])' +
+                        ':not([type=reset]):not([type=hidden]):not([type=file]),' +
+                        'textarea'
+                    );
+
+                    fields.forEach(el => {
+                        // Skip the field we already filled with the payload.
+                        try { if (el.matches(skipSel)) return; } catch (_) {}
+
+                        // Skip disabled / readonly elements.
+                        if (el.disabled || el.readOnly) return;
+
+                        // Skip ARIA-managed / combobox inputs.
+                        if (el.hasAttribute('aria-autocomplete')) return;
+                        if (el.hasAttribute('aria-haspopup'))     return;
+                        if (el.hasAttribute('aria-invalid'))      return;
+
+                        // Skip inputs inside a combobox / listbox ancestor.
+                        let p = el.parentElement;
+                        while (p) {
+                            const r = p.getAttribute('role');
+                            if (r === 'combobox' || r === 'listbox') return;
+                            p = p.parentElement;
+                        }
+
+                        const prev = el.value;
+                        el.value = rand();
+                        el.dispatchEvent(new Event('input',  {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+
+                        // If validation rejected the dummy value restore original.
+                        if (el.getAttribute('aria-invalid') === 'true') {
+                            el.value = prev;
+                            el.dispatchEvent(new Event('input',  {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    });
+                }
+                """,
+                [skip.form_selector, skip.selector],
             )
-            for el in siblings:
-                el_id = await el.get_attribute("id")
-                name = await el.get_attribute("name")
-                tag = (await el.evaluate("e => e.tagName")).lower()
-                sibling_sel = (
-                    f"#{el_id}" if el_id else f"{tag}[name='{name}']" if name else ""
-                )
-                if sibling_sel and sibling_sel == skip.selector:
-                    continue
-                try:
-                    await el.fill("test")
-                except PlaywrightError:
-                    pass
         except PlaywrightError as exc:
             logger.debug("Error filling sibling inputs: %s", exc)
