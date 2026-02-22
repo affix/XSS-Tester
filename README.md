@@ -468,6 +468,56 @@ xss-tester/
 
 ---
 
+## Testing
+
+The test suite covers all pure/synchronous logic — no live browser or network
+connection is required.
+
+### Running tests
+
+```bash
+# Run the full suite
+uv run pytest
+
+# Verbose output (show each test name)
+uv run pytest -v
+
+# Run a single module
+uv run pytest tests/test_spider.py -v
+
+# Run a single test class or case
+uv run pytest tests/test_auth.py::TestLoadAuthConfig -v
+uv run pytest tests/test_tester.py::TestBuildInjectedUrl::test_preserves_other_params -v
+```
+
+### What is tested
+
+| Module | Test file | Methods covered |
+|---|---|---|
+| `Spider` | `tests/test_spider.py` | `_normalize_url`, `_in_scope`, `_should_skip`, `_build_selector`, `_extract_url_params` |
+| `Tester` | `tests/test_tester.py` | `_load_payloads`, `_build_injected_url`, `_resolve_oob_payload` |
+| `Auth` | `tests/test_auth.py` | `has_auth`, `is_login_page`, `_load_auth_config` |
+| `Models` | `tests/test_models.py` | `Finding`, `PageData`, `InputField`, `UrlParam` construction and defaults |
+| `Reporter` | `tests/test_reporter.py` | `log_finding`, `save`, initial counters |
+| `Interactsh` | `tests/test_interactsh.py` | `interaction_host`, `interaction_test_id` |
+
+Async methods that require a live Playwright `BrowserContext` (crawling,
+injection, login) are not covered by the unit tests. Where Playwright objects
+are needed as constructor arguments, `unittest.mock.MagicMock` is used so that
+pure methods can be exercised in isolation.
+
+### Test configuration
+
+pytest is configured in `pyproject.toml`:
+
+```toml
+[tool.pytest.ini_options]
+pythonpath = ["."]   # makes all packages importable without installing
+testpaths = ["tests"]
+```
+
+---
+
 ## Extending the Tool
 
 The codebase is organised as Python packages; each module has a single
