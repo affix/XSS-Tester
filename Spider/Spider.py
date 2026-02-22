@@ -89,8 +89,6 @@ class Spider:
         # Tracks (netloc, path, frozenset(param_names)) to avoid re-crawling
         # URLs that differ only in GET parameter values.
         self._visited_param_sigs: set[tuple] = set()
-        # BFS queue of (normalised_url, depth)
-        self._queue: list[tuple[str, int]] = []
 
     # ------------------------------------------------------------------
     # Public interface
@@ -99,65 +97,76 @@ class Spider:
     async def crawl(self) -> list[PageData]:
         """Crawl from :attr:`base_url` and return discovered :class:`PageData`.
 
-        Uses a simple BFS queue. Each URL is visited once; discovered links
-        are enqueued up to :attr:`max_depth`. Crawl stops when the queue is
-        empty, :attr:`max_pages` is reached, or a shutdown is requested.
+        Uses a level-by-level BFS where all URLs at the same depth are visited
+        concurrently via :func:`asyncio.gather`. Concurrency is still bounded
+        by the shared :class:`asyncio.Semaphore`. Crawl stops when the queue
+        is empty, :attr:`max_pages` is reached, or a shutdown is requested.
         """
-        self._queue.append((self.base_url, 0))
+        current_batch: list[tuple[str, int]] = [(self.base_url, 0)]
         results: list[PageData] = []
 
-        while self._queue and not self.shutdown_event.is_set():
-            if len(self._visited) >= self.max_pages:
-                logger.info("max-pages limit (%d) reached", self.max_pages)
+        async def _bounded_visit(url: str, depth: int) -> Optional[PageData]:
+            async with self.semaphore:
+                return await self._visit_page(url, depth)
+
+        while current_batch and not self.shutdown_event.is_set():
+            # Deduplicate and filter the batch before dispatching
+            to_visit: list[tuple[str, int]] = []
+            for url, depth in current_batch:
+                if len(self._visited) >= self.max_pages:
+                    logger.info("max-pages limit (%d) reached", self.max_pages)
+                    break
+                norm_url = self._normalize_url(url)
+                if not norm_url:
+                    continue
+                if norm_url in self._visited:
+                    continue
+                if not self._in_scope(norm_url):
+                    continue
+                if self._should_skip(norm_url):
+                    continue
+                param_sig = self._param_signature(norm_url)
+                if param_sig in self._visited_param_sigs:
+                    logger.debug("Skipping %s — same path+params already crawled", norm_url)
+                    continue
+                self._visited.add(norm_url)
+                self._visited_param_sigs.add(param_sig)
+                to_visit.append((norm_url, depth))
+
+            if not to_visit:
                 break
 
-            url, depth = self._queue.pop(0)
-            norm_url = self._normalize_url(url)
-
-            if not norm_url:
-                continue
-            if norm_url in self._visited:
-                continue
-            if not self._in_scope(norm_url):
-                continue
-            if self._should_skip(norm_url):
-                continue
-
-            param_sig = self._param_signature(norm_url)
-            if param_sig in self._visited_param_sigs:
-                logger.debug("Skipping %s — same path+params already crawled", norm_url)
-                continue
-
-            self._visited.add(norm_url)
-            self._visited_param_sigs.add(param_sig)
-
-            async with self.semaphore:
-                page_data = await self._visit_page(norm_url, depth)
-
-            if page_data is None:
-                continue
-
-            # Mark the final (post-redirect) URL as visited so a direct link
-            # to the redirected URL doesn't cause it to be crawled again.
-            norm_final = self._normalize_url(page_data.url)
-            if norm_final and norm_final != norm_url:
-                self._visited.add(norm_final)
-
-            results.append(page_data)
-            self.reporter.pages_crawled += 1
-            self.reporter.log_info(
-                f"Crawled [cyan]{page_data.url}[/cyan]  "
-                f"inputs=[yellow]{len(page_data.inputs)}[/yellow]  "
-                f"url-params=[yellow]{len(page_data.url_params)}[/yellow]  "
-                f"depth={depth}"
+            # Visit the whole batch concurrently
+            page_datas = await asyncio.gather(
+                *[_bounded_visit(url, depth) for url, depth in to_visit],
+                return_exceptions=True,
             )
 
-            # Enqueue newly discovered links
-            if depth < self.max_depth:
-                for link_url in page_data.links:
-                    norm_link = self._normalize_url(link_url)
-                    if norm_link and norm_link not in self._visited:
-                        self._queue.append((norm_link, depth + 1))
+            next_batch: list[tuple[str, int]] = []
+            for (norm_url, depth), page_data in zip(to_visit, page_datas):
+                if isinstance(page_data, Exception) or page_data is None:
+                    continue
+
+                # Mark the final (post-redirect) URL as visited so a direct
+                # link to it doesn't cause it to be crawled again.
+                norm_final = self._normalize_url(page_data.url)
+                if norm_final and norm_final != norm_url:
+                    self._visited.add(norm_final)
+
+                results.append(page_data)
+                self.reporter.pages_crawled += 1
+                self.reporter.log_info(
+                    f"Crawled [cyan]{page_data.url}[/cyan]  "
+                    f"inputs=[yellow]{len(page_data.inputs)}[/yellow]  "
+                    f"url-params=[yellow]{len(page_data.url_params)}[/yellow]  "
+                    f"depth={depth}"
+                )
+
+                if depth < self.max_depth:
+                    for link_url in page_data.links:
+                        next_batch.append((link_url, depth + 1))
+
+            current_batch = next_batch
 
             if self.delay:
                 await asyncio.sleep(self.delay)
@@ -269,88 +278,87 @@ class Spider:
     async def _extract_inputs(self, page: Page) -> list[InputField]:
         """Return all testable ``<input>``, ``<textarea>``, and ``<select>`` elements.
 
-        Processes form-bound fields first, then standalone (orphaned) inputs.
-        Elements that are disabled, read-only, or otherwise non-editable are
-        skipped — Dojo and similar widget frameworks inject hidden/readonly
-        internal inputs alongside the real editable ones.
+        All DOM attribute reads are batched into a single ``page.evaluate()``
+        call to eliminate per-element IPC round-trips. Elements that are
+        disabled or read-only are filtered out in the browser process.
         """
         inputs: list[InputField] = []
-        _skip_types = {"submit", "button", "reset", "image", "file", "hidden"}
-
         try:
-            # ── Form-bound inputs ──────────────────────────────────────────
-            forms = await page.query_selector_all("form")
-            for form_idx, form in enumerate(forms):
-                # Build a reasonably unique selector for this form
-                form_id = await form.get_attribute("id")
-                form_sel = f"#{form_id}" if form_id else f"form:nth-of-type({form_idx + 1})"
+            raw = await page.evaluate("""
+                () => {
+                    const skipTypes = new Set(
+                        ['submit','button','reset','image','file','hidden']
+                    );
+                    const formFields = [];
+                    const orphanFields = [];
 
-                raw_action = await form.get_attribute("action") or page.url
-                action = urljoin(page.url, raw_action)
-                method = (await form.get_attribute("method") or "GET").upper()
+                    // ── Form-bound inputs ──────────────────────────────────
+                    document.querySelectorAll('form').forEach((form, formIdx) => {
+                        const formId  = form.id || '';
+                        const formSel = formId
+                            ? '#' + formId
+                            : 'form:nth-of-type(' + (formIdx + 1) + ')';
+                        const action  = form.action || location.href;
+                        const method  = (form.method || 'GET').toUpperCase();
 
-                field_els = await form.query_selector_all(
-                    "input, textarea, select"
-                )
-                for el in field_els:
-                    tag = (await el.evaluate("e => e.tagName")).lower()
-                    itype = (await el.get_attribute("type") or "text").lower()
-                    if itype in _skip_types:
-                        continue
+                        form.querySelectorAll('input, textarea, select').forEach(el => {
+                            const tag   = el.tagName.toLowerCase();
+                            const itype = (el.getAttribute('type') || 'text').toLowerCase();
+                            if (skipTypes.has(itype)) return;
+                            if (el.disabled || el.readOnly)  return;
 
-                    # Skip disabled / readonly elements — they cannot be filled
-                    try:
-                        if not await el.is_editable():
-                            continue
-                    except PlaywrightError:
-                        continue
+                            formFields.push({
+                                tag, itype, formIdx,
+                                name:    el.name    || null,
+                                id:      el.id      || null,
+                                formSel, action, method,
+                            });
+                        });
+                    });
 
-                    name = await el.get_attribute("name")
-                    el_id = await el.get_attribute("id")
-                    selector = self._build_selector(tag, name, el_id, form_idx)
+                    // ── Standalone inputs (not inside any form) ────────────
+                    document.querySelectorAll(
+                        'input:not(form input), ' +
+                        'textarea:not(form textarea), ' +
+                        'select:not(form select)'
+                    ).forEach(el => {
+                        const tag   = el.tagName.toLowerCase();
+                        const itype = (el.getAttribute('type') || 'text').toLowerCase();
+                        if (skipTypes.has(itype)) return;
+                        if (el.disabled || el.readOnly) return;
 
-                    inputs.append(
-                        InputField(
-                            selector=selector,
-                            name=name,
-                            input_type=itype if tag == "input" else tag,
-                            form_selector=form_sel,
-                            form_action=action,
-                            form_method=method,
-                        )
-                    )
+                        orphanFields.push({
+                            tag, itype,
+                            name: el.name || null,
+                            id:   el.id   || null,
+                        });
+                    });
 
-            # ── Standalone inputs (not inside any form) ────────────────────
-            orphan_els = await page.query_selector_all(
-                "input:not(form input), textarea:not(form textarea), select:not(form select)"
-            )
-            for el in orphan_els:
-                tag = (await el.evaluate("e => e.tagName")).lower()
-                itype = (await el.get_attribute("type") or "text").lower()
-                if itype in _skip_types:
-                    continue
+                    return { formFields, orphanFields };
+                }
+            """)
 
-                # Skip disabled / readonly elements
-                try:
-                    if not await el.is_editable():
-                        continue
-                except PlaywrightError:
-                    continue
+            for f in raw["formFields"]:
+                selector = self._build_selector(f["tag"], f["name"], f["id"], f["formIdx"])
+                inputs.append(InputField(
+                    selector=selector,
+                    name=f["name"],
+                    input_type=f["itype"] if f["tag"] == "input" else f["tag"],
+                    form_selector=f["formSel"],
+                    form_action=f["action"],
+                    form_method=f["method"],
+                ))
 
-                name = await el.get_attribute("name")
-                el_id = await el.get_attribute("id")
-                selector = self._build_selector(tag, name, el_id, 0)
-
-                inputs.append(
-                    InputField(
-                        selector=selector,
-                        name=name,
-                        input_type=itype if tag == "input" else tag,
-                        form_selector=None,
-                        form_action=None,
-                        form_method="GET",
-                    )
-                )
+            for f in raw["orphanFields"]:
+                selector = self._build_selector(f["tag"], f["name"], f["id"], 0)
+                inputs.append(InputField(
+                    selector=selector,
+                    name=f["name"],
+                    input_type=f["itype"] if f["tag"] == "input" else f["tag"],
+                    form_selector=None,
+                    form_action=None,
+                    form_method="GET",
+                ))
 
         except PlaywrightError as exc:
             logger.debug("Error extracting inputs from page: %s", exc)
