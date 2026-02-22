@@ -282,6 +282,8 @@ async def _build_context(
 async def run(args: argparse.Namespace) -> None:
     """Orchestrate authentication, crawling, testing, and reporting."""
     reporter = Reporter(output_file=args.output)
+    reporter.print_banner()
+
     shutdown_event = asyncio.Event()
 
     # ── SIGINT handler ────────────────────────────────────────────────────────
@@ -307,6 +309,11 @@ async def run(args: argparse.Namespace) -> None:
 
         # ── Step 1: authenticate in a temporary context ───────────────────────
         if auth_manager.has_auth():
+            if args.auth_script:
+                reporter.log_info(f"Authentication:      [bold cyan]Script ({args.auth_script})[/bold cyan]")
+            elif args.cookies:
+                reporter.log_info("Authentication:      [bold cyan]Cookies[/bold cyan]")
+        
             auth_ctx_kwargs: dict = {}
             if args.proxy:
                 auth_ctx_kwargs["proxy"] = {"server": args.proxy}
@@ -317,11 +324,11 @@ async def run(args: argparse.Namespace) -> None:
                 await auth_manager.authenticate(auth_ctx, args.base_url)
             finally:
                 await auth_ctx.close()
-
+        else:
+            reporter.log_info("Authentication:      [yellow]None[/yellow]")
         # ── Step 2: main context (reuses saved storage state) ─────────────────
         context = await _build_context(browser, args)
 
-        reporter.print_banner()
         reporter.log_info(f"Target:      [bold cyan]{args.base_url}[/bold cyan]")
         reporter.log_info(f"Max pages:   {args.max_pages}   depth: {args.max_depth}")
         reporter.log_info(f"Concurrency: {args.concurrency}   delay: {args.delay}s")
@@ -413,7 +420,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Logging setup ─────────────────────────────────────────────────────────
-    log_level = logging.DEBUG if args.verbose else logging.INFO
+    log_level = logging.DEBUG if args.verbose else logging.ERROR
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
