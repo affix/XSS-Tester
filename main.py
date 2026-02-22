@@ -326,6 +326,8 @@ async def run(args: argparse.Namespace) -> None:
                 await auth_ctx.close()
         else:
             reporter.log_info("Authentication:      [yellow]None[/yellow]")
+
+
         # ── Step 2: main context (reuses saved storage state) ─────────────────
         context = await _build_context(browser, args)
 
