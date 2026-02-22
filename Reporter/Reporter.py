@@ -8,12 +8,24 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
+from typing import Generator, Tuple
 
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 
 from Models import Finding
@@ -78,6 +90,28 @@ class Reporter:
     def log_debug(self, message: str) -> None:
         """Emit a structured debug log (not printed to console)."""
         logger.debug(message)
+
+    @contextmanager
+    def testing_progress(self, total: int) -> Generator[Tuple[Progress, TaskID], None, None]:
+        """Context manager that renders a Rich progress bar for the testing phase.
+
+        Yields ``(progress, task_id)`` so callers can call
+        ``progress.advance(task_id)`` as each injection completes.
+        Uses the shared *console* so that ``log_finding`` / ``log_info`` output
+        is rendered above the live bar without corrupting the display.
+        """
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
+            task_id = progress.add_task("[cyan]Testing…[/cyan]", total=total)
+            yield progress, task_id
 
     # ------------------------------------------------------------------
     # Persistence

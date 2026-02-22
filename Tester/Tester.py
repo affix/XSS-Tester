@@ -107,28 +107,26 @@ class XSSTester:
             self._interactsh = InteractshClient(self.interactsh_url)
             await self._interactsh.register()
 
-        # Build every injection task upfront
+        # Build every injection coroutine upfront (not yet scheduled)
         _alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 
         def _new_test_id() -> str:
             # Must be <= InteractshClient.NONCE_LENGTH (13) lowercase alphanumeric chars
             return "".join(secrets.choice(_alphabet) for _ in range(13))
 
-        tasks: list[asyncio.Task] = []
+        coros = []
         for page_data in pages:
             if not self._get_params_only:
                 for inp in page_data.inputs:
                     for payload in self._payloads:
                         test_id = _new_test_id()
                         self.reporter.inputs_tested += 1
-                        tasks.append(
-                            asyncio.ensure_future(
-                                self._inject_into_input(
-                                    page_url=page_data.url,
-                                    inp=inp,
-                                    payload=payload,
-                                    test_id=test_id,
-                                )
+                        coros.append(
+                            self._inject_into_input(
+                                page_url=page_data.url,
+                                inp=inp,
+                                payload=payload,
+                                test_id=test_id,
                             )
                         )
 
@@ -136,25 +134,33 @@ class XSSTester:
                 for payload in self._payloads:
                     test_id = _new_test_id()
                     self.reporter.inputs_tested += 1
-                    tasks.append(
-                        asyncio.ensure_future(
-                            self._inject_into_url_param(
-                                url_param=url_param,
-                                payload=payload,
-                                test_id=test_id,
-                            )
+                    coros.append(
+                        self._inject_into_url_param(
+                            url_param=url_param,
+                            payload=payload,
+                            test_id=test_id,
                         )
                     )
 
         self.reporter.log_info(
-            f"Testing [bold]{len(tasks)}[/bold] injection points "
+            f"Testing [bold]{len(coros)}[/bold] injection points "
             f"([yellow]{len(self._payloads)}[/yellow] payloads × inputs)…"
         )
 
-        try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.CancelledError:
-            pass
+        async def _track(coro, progress, task_id):
+            try:
+                return await coro
+            finally:
+                progress.advance(task_id)
+
+        with self.reporter.testing_progress(len(coros)) as (progress, task_id):
+            try:
+                await asyncio.gather(
+                    *[_track(c, progress, task_id) for c in coros],
+                    return_exceptions=True,
+                )
+            except asyncio.CancelledError:
+                pass
 
         # Launch the OOB sweep in a background thread so the event loop stays
         # responsive during the wait period.  Call join_oob_thread() afterwards
