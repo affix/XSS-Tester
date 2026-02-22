@@ -1,3 +1,3 @@
-from .Manager import AuthConfig, AuthManager
+from .Manager import AuthConfig, AuthManager, StepBasedAuthConfig
 
-__all__ = ["AuthConfig", "AuthManager"]
+__all__ = ["AuthConfig", "AuthManager", "StepBasedAuthConfig"]

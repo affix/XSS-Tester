@@ -123,9 +123,16 @@ usage: xss-tester [-h] --base-url URL [--scope PATH]
 
 ## Authentication
 
-### Form-based login (--auth-script)
+Three auth-script formats are supported and detected automatically from the
+file extension and content.  After a successful login the Playwright storage
+state (cookies + localStorage) is saved to `.auth_state.json` and reused for
+all subsequent browser contexts.  The tool also detects session expiry
+(redirect back to `login_url`) and automatically re-authenticates.
 
-Create a JSON file describing the login page:
+### 1. Simple JSON (--auth-script auth.json)
+
+Best for a single-page form login.  Create a JSON file describing the login
+page:
 
 ```json
 {
@@ -149,10 +156,79 @@ Create a JSON file describing the login page:
 | `submit_selector` | Yes | CSS selector for the submit button |
 | `success_indicator` | No | CSS selector expected **after** login (e.g. `.dashboard`). Used to verify success; scan continues even if absent. |
 
-After login the Playwright storage state (cookies + localStorage) is saved to
-`.auth_state.json` and reused for all subsequent browser contexts.  The tool
-also detects session expiry (redirect back to `login_url`) and automatically
-re-authenticates.
+### 2. Step-based JSON (--auth-script auth.json)
+
+Best for multi-step flows: MFA, OAuth redirects, CAPTCHAs, etc.  The presence
+of a `"steps"` key is detected automatically.
+
+```json
+{
+  "login_url": "https://target.com/login",
+  "success_selector": ".dashboard",
+  "steps": [
+    {"action": "goto",               "url": "https://target.com/login"},
+    {"action": "fill",               "selector": "#username", "value": "admin"},
+    {"action": "fill",               "selector": "#password", "value": "secret"},
+    {"action": "click",              "selector": "[type=submit]"},
+    {"action": "wait_for_selector",  "selector": "#mfa-input"},
+    {"action": "fill",               "selector": "#mfa-input", "value": "123456"},
+    {"action": "click",              "selector": "#verify-btn"},
+    {"action": "wait_for_load_state","state": "networkidle"}
+  ]
+}
+```
+
+| Key | Required | Description |
+|---|---|---|
+| `login_url` | Yes | Full URL of the login page (used for session-expiry detection) |
+| `steps` | Yes | Non-empty array of step objects (see table below) |
+| `success_selector` | No | CSS selector expected after the last step |
+
+**Supported step actions:**
+
+| `action` | Required keys | Optional keys |
+|---|---|---|
+| `goto` | `url` | `timeout` |
+| `fill` | `selector`, `value` | `timeout` |
+| `click` | `selector` | `timeout` |
+| `select_option` | `selector`, `value` | `timeout` |
+| `check` / `uncheck` | `selector` | `timeout` |
+| `press` | `selector`, `key` | `timeout` |
+| `hover` | `selector` | `timeout` |
+| `wait_for_selector` | `selector` | `timeout` |
+| `wait_for_load_state` | — | `state` (default `networkidle`), `timeout` |
+| `wait_for_timeout` | `ms` | — |
+
+Unknown actions are skipped with a warning so the flow continues.
+
+### 3. Python script (--auth-script auth_flow.py)
+
+Maximum flexibility — use TOTP libraries, environment variables, dynamic logic,
+or anything Playwright supports.  The file must define an async function with
+this exact signature:
+
+```python
+# auth_flow.py — run `playwright codegen https://target.com` to record a
+# starting point, then adapt it to this signature.
+import os
+
+async def authenticate(page):
+    await page.goto("https://target.com/login")
+    await page.fill("#username", os.environ["TARGET_USER"])
+    await page.fill("#password", os.environ["TARGET_PASS"])
+    await page.click("[type=submit]")
+    await page.wait_for_load_state("networkidle")
+    # Handle MFA, OAuth callbacks, etc.
+    await page.wait_for_selector(".dashboard")
+```
+
+```bash
+TARGET_USER=admin TARGET_PASS=secret \
+  python main.py --base-url https://target.com --auth-script auth_flow.py
+```
+
+> **Note:** Because Python scripts have no `login_url`, automatic session-expiry
+> detection is disabled when using this format.
 
 ### Cookie injection (--cookies)
 

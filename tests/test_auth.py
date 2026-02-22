@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from Auth import AuthManager
+from Auth import AuthManager, StepBasedAuthConfig
 
 
 # ---------------------------------------------------------------------------
@@ -182,3 +182,120 @@ class TestLoadAuthConfig:
             path.write_text(json.dumps(partial))
             m = AuthManager(auth_script=str(path), cookies_str=None)
             assert m.auth_config is None, f"Expected auth_config=None when '{key}' is missing"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for step-based / Python script tests
+# ---------------------------------------------------------------------------
+
+
+def _write_steps_config(tmp_path, **overrides) -> str:
+    """Write a minimal valid step-based auth-script JSON and return the path."""
+    config = {
+        "login_url": "https://example.com/login",
+        "steps": [
+            {"action": "goto", "url": "https://example.com/login"},
+            {"action": "fill", "selector": "#user", "value": "admin"},
+            {"action": "click", "selector": "[type=submit]"},
+        ],
+    }
+    config.update(overrides)
+    path = tmp_path / "steps_auth.json"
+    path.write_text(json.dumps(config))
+    return str(path)
+
+
+def _write_py_script(tmp_path, content: str = None) -> str:
+    """Write a minimal Python auth script and return the path."""
+    if content is None:
+        content = "async def authenticate(page):\n    pass\n"
+    path = tmp_path / "auth_flow.py"
+    path.write_text(content)
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
+# TestStepsAuthConfig
+# ---------------------------------------------------------------------------
+
+
+class TestStepsAuthConfig:
+    def test_valid_steps_json_sets_steps_config(self, tmp_path):
+        path = _write_steps_config(tmp_path)
+        m = AuthManager(auth_script=path, cookies_str=None)
+        assert m.steps_config is not None
+        assert m.auth_config is None
+
+    def test_has_auth_returns_true_with_steps_config(self, tmp_path):
+        path = _write_steps_config(tmp_path)
+        m = AuthManager(auth_script=path, cookies_str=None)
+        assert m.has_auth() is True
+
+    def test_is_login_page_uses_steps_config_login_url(self, tmp_path):
+        path = _write_steps_config(tmp_path)
+        m = AuthManager(auth_script=path, cookies_str=None)
+        assert m.is_login_page("https://example.com/login") is True
+        assert m.is_login_page("https://example.com/dashboard") is False
+
+    def test_missing_login_url_leaves_steps_config_none(self, tmp_path):
+        config = {
+            "steps": [{"action": "goto", "url": "https://example.com/login"}],
+        }
+        path = tmp_path / "no_url.json"
+        path.write_text(json.dumps(config))
+        m = AuthManager(auth_script=str(path), cookies_str=None)
+        assert m.steps_config is None
+
+    def test_empty_steps_list_leaves_steps_config_none(self, tmp_path):
+        path = _write_steps_config(tmp_path, steps=[])
+        m = AuthManager(auth_script=path, cookies_str=None)
+        assert m.steps_config is None
+
+    def test_success_selector_is_loaded_when_present(self, tmp_path):
+        path = _write_steps_config(tmp_path, success_selector=".dashboard")
+        m = AuthManager(auth_script=path, cookies_str=None)
+        assert m.steps_config is not None
+        assert m.steps_config.success_selector == ".dashboard"
+
+    def test_success_selector_defaults_to_none_when_absent(self, tmp_path):
+        path = _write_steps_config(tmp_path)
+        m = AuthManager(auth_script=path, cookies_str=None)
+        assert m.steps_config is not None
+        assert m.steps_config.success_selector is None
+
+    def test_steps_list_is_preserved(self, tmp_path):
+        path = _write_steps_config(tmp_path)
+        m = AuthManager(auth_script=path, cookies_str=None)
+        assert len(m.steps_config.steps) == 3
+        assert m.steps_config.steps[0]["action"] == "goto"
+
+
+# ---------------------------------------------------------------------------
+# TestPythonScriptAuth
+# ---------------------------------------------------------------------------
+
+
+class TestPythonScriptAuth:
+    def test_valid_py_file_sets_script_path(self, tmp_path):
+        path = _write_py_script(tmp_path)
+        m = AuthManager(auth_script=path, cookies_str=None)
+        assert m._script_path == path
+        assert m.auth_config is None
+        assert m.steps_config is None
+
+    def test_has_auth_returns_true_when_script_path_set(self, tmp_path):
+        path = _write_py_script(tmp_path)
+        m = AuthManager(auth_script=path, cookies_str=None)
+        assert m.has_auth() is True
+
+    def test_missing_py_file_leaves_script_path_none(self, tmp_path):
+        missing = str(tmp_path / "nonexistent.py")
+        m = AuthManager(auth_script=missing, cookies_str=None)
+        assert m._script_path is None
+
+    def test_is_login_page_returns_false_for_python_script_mode(self, tmp_path):
+        path = _write_py_script(tmp_path)
+        m = AuthManager(auth_script=path, cookies_str=None)
+        # Python scripts have no login_url — session expiry detection is skipped
+        assert m.is_login_page("https://example.com/login") is False
+        assert m.is_login_page("https://example.com/dashboard") is False
