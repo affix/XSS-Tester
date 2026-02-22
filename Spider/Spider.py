@@ -5,7 +5,8 @@ Crawls from a base URL, stays within the target domain and optional scope
 path, waits for SPA network-idle states, and extracts:
   - All HTML form inputs and standalone inputs
   - URL parameters present in the page URL
-  - Outgoing links for further crawling
+  - Outgoing links for further crawling, including links hidden inside
+    JavaScript-driven dropdown menus (Dojo dijit/MenuBar, ARIA menus, etc.)
 """
 from __future__ import annotations
 
@@ -191,17 +192,35 @@ class Spider:
                 logger.debug("Non-HTML content-type '%s' for %s — skipping", content_type, url)
                 return None
 
-            final_url = page.url
+            browser_url = page.url
 
             # If the server redirected outside our target domain, skip
-            if not self._in_scope(final_url):
+            if not self._in_scope(browser_url):
                 logger.debug(
-                    "Redirect left scope: %s -> %s — skipping", url, final_url
+                    "Redirect left scope: %s -> %s — skipping", url, browser_url
                 )
                 return None
 
-            if final_url != url:
-                logger.debug("Redirect followed: %s -> %s", url, final_url)
+            # Some applications (e.g. Dojo/Struts apps) use a single catch-all
+            # URL (e.g. IndexAction.action) for all views via server-side
+            # forwarding.  When the browser URL after navigation is already
+            # recorded as visited but differs from what was requested, every
+            # distinct page would otherwise collapse to the same URL entry,
+            # breaking both deduplication and payload re-navigation.
+            # In that case prefer the originally requested href as the page
+            # identity so each action URL is stored and re-navigable on its own.
+            norm_browser = self._normalize_url(browser_url)
+            if norm_browser in self._visited and norm_browser != self._normalize_url(url):
+                final_url = url
+                logger.debug(
+                    "Catch-all URL detected (%s) — using requested href as page identity: %s",
+                    browser_url,
+                    url,
+                )
+            else:
+                final_url = browser_url
+                if browser_url != url:
+                    logger.debug("Redirect followed: %s -> %s", url, browser_url)
 
             page_data = PageData(url=final_url, depth=depth)
             page_data.inputs = await self._extract_inputs(page)
@@ -309,8 +328,18 @@ class Spider:
     async def _extract_links(self, page: Page) -> list[str]:
         """Return all in-scope, non-skippable absolute URLs from the page.
 
-        Collects links from ``<a href>``, ``<form action>``, and also looks
-        for JavaScript navigation patterns by evaluating anchor elements.
+        Collects links from:
+
+        - ``<a href>`` elements
+        - ``<form action>`` attributes
+        - Non-anchor elements with an ``href`` attribute (Dojo widgets often
+          render menu items as ``<div>``/``<span>``/``<td>`` with ``href``)
+        - ``onclick`` attributes containing ``location.href`` assignments
+        - Dojo ``data-dojo-props="href: '...'"`` declarations
+        - The Dojo widget registry (``window.dijit.registry``) for
+          programmatically-created menus
+        - JS dropdown menus revealed by clicking triggers (see
+          :meth:`_expand_dropdowns`)
         """
         raw: list[str] = []
         try:
@@ -326,8 +355,77 @@ class Spider:
             )
             raw.extend(actions)
 
+            # href on non-anchor elements (Dojo/widget links on div/span/td/tr)
+            non_anchor: list[str] = await page.eval_on_selector_all(
+                "[href]:not(a)",
+                "els => els.map(e => e.href || e.getAttribute('href')).filter(Boolean)",
+            )
+            raw.extend(non_anchor)
+
+            # onclick attributes that directly assign location.href
+            onclick_urls: list[str] = await page.evaluate(r"""
+                () => {
+                    const pat = /(?:location\.href|window\.location(?:\.href)?)\s*=\s*['"]([^'"]+)['"]/g;
+                    const out = [];
+                    document.querySelectorAll('[onclick]').forEach(el => {
+                        const s = el.getAttribute('onclick') || '';
+                        let m;
+                        while ((m = pat.exec(s)) !== null) {
+                            try { out.push(new URL(m[1], location.href).href); } catch (_) {}
+                        }
+                    });
+                    return out;
+                }
+            """)
+            raw.extend(onclick_urls)
+
+            # Dojo data-dojo-props="href: '/path'" declarative links
+            dojo_prop_urls: list[str] = await page.evaluate(r"""
+                () => {
+                    const out = [];
+                    document.querySelectorAll('[data-dojo-props]').forEach(el => {
+                        const props = el.getAttribute('data-dojo-props') || '';
+                        const m = props.match(/\bhref\s*:\s*['"]([^'"]+)['"]/);
+                        if (m) {
+                            try { out.push(new URL(m[1], location.href).href); } catch (_) {}
+                        }
+                    });
+                    return out;
+                }
+            """)
+            raw.extend(dojo_prop_urls)
+
+            # Dojo widget registry — catches programmatically-created menus
+            dojo_registry_urls: list[str] = await page.evaluate("""
+                () => {
+                    const out = [];
+                    if (!window.dijit || !window.dijit.registry) return out;
+                    try {
+                        window.dijit.registry.forEach(w => {
+                            if (w.href) {
+                                try { out.push(new URL(w.href, location.href).href); } catch (_) {}
+                            }
+                            if (w.getChildren) {
+                                try {
+                                    w.getChildren().forEach(c => {
+                                        if (c.href) {
+                                            try { out.push(new URL(c.href, location.href).href); } catch (_) {}
+                                        }
+                                    });
+                                } catch (_) {}
+                            }
+                        });
+                    } catch (_) {}
+                    return out;
+                }
+            """)
+            raw.extend(dojo_registry_urls)
+
         except PlaywrightError as exc:
-            logger.debug("Error extracting links: %s", exc)
+            logger.debug("Error extracting static links: %s", exc)
+
+        # Interactively open JS/Dojo dropdown menus and harvest hidden links
+        raw.extend(await self._expand_dropdowns(page))
 
         links: list[str] = []
         seen: set[str] = set()
@@ -338,6 +436,118 @@ class Spider:
                 links.append(norm)
 
         return links
+
+    async def _expand_dropdowns(self, page: Page) -> list[str]:
+        """Click JS/Dojo dropdown triggers and return links revealed in popups.
+
+        Handles:
+
+        - Dojo ``dijit/MenuBar`` items (``.dijitMenuBarItem``)
+        - Dojo ``dijit/DropDownButton`` (``.dijitDropDownButton``)
+        - Dojo ``data-dojo-type`` MenuBarItem / DropDownButton widgets
+        - ARIA dropdown triggers (``[aria-haspopup=true]``)
+        - Generic ``[data-toggle=dropdown]`` (Bootstrap-style hybrids)
+
+        Each trigger is clicked once; Escape is sent to close the popup before
+        moving to the next trigger. Per-trigger errors are swallowed so one
+        broken widget does not abort the whole extraction.
+        """
+        raw: list[str] = []
+
+        trigger_selectors = [
+            ".dijitMenuBarItem",
+            ".dijitDropDownButton",
+            "[data-dojo-type*='MenuBarItem']",
+            "[data-dojo-type*='DropDownButton']",
+            "[aria-haspopup='true']",
+            "[data-toggle='dropdown']",
+        ]
+
+        link_selectors = ", ".join([
+            ".dijitPopup a[href]",
+            ".dijitMenu a[href]",
+            ".dijitMenuItem[href]",
+            "[role='menu'] a[href]",
+            "[role='menuitem'] a[href]",
+            "[role='option'] a[href]",
+        ])
+
+        # JS snippet to scrape onclick-embedded URLs from open popup containers
+        _onclick_in_popup = r"""
+            () => {
+                const pat = /(?:location\.href|window\.location(?:\.href)?)\s*=\s*['"]([^'"]+)['"]/g;
+                const out = [];
+                const scope = '.dijitPopup, .dijitMenu, [role="menu"], [role="listbox"]';
+                document.querySelectorAll(scope).forEach(c =>
+                    c.querySelectorAll('[onclick]').forEach(el => {
+                        const s = el.getAttribute('onclick') || '';
+                        let m;
+                        while ((m = pat.exec(s)) !== null) {
+                            try { out.push(new URL(m[1], location.href).href); } catch (_) {}
+                        }
+                    })
+                );
+                return out;
+            }
+        """
+
+        tried: set[str] = set()  # dedup triggers by trimmed text content
+
+        for selector in trigger_selectors:
+            try:
+                triggers = await page.query_selector_all(selector)
+            except PlaywrightError as exc:
+                logger.debug("Dropdown query for '%s' failed: %s", selector, exc)
+                continue
+
+            for trigger in triggers:
+                try:
+                    label = ((await trigger.text_content()) or "").strip()[:80]
+                    if label in tried:
+                        continue
+                    tried.add(label)
+
+                    await trigger.hover(timeout=2_000)
+                    await trigger.click(timeout=2_000)
+
+                    # Wait for a popup to become visible; fall back to fixed delay
+                    try:
+                        await page.wait_for_selector(
+                            ".dijitPopup, [role='menu'], [role='listbox']",
+                            state="visible",
+                            timeout=1_000,
+                        )
+                    except PlaywrightError:
+                        await page.wait_for_timeout(400)
+
+                    # Harvest hrefs from revealed popup items
+                    try:
+                        popup_hrefs: list[str] = await page.eval_on_selector_all(
+                            link_selectors,
+                            "els => els.map(e => e.href || e.getAttribute('href')).filter(Boolean)",
+                        )
+                        raw.extend(popup_hrefs)
+                    except PlaywrightError:
+                        pass
+
+                    # Harvest onclick-embedded URLs from popup items
+                    try:
+                        raw.extend(await page.evaluate(_onclick_in_popup))
+                    except PlaywrightError:
+                        pass
+
+                    # Dismiss the popup before opening the next one
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(150)
+
+                except PlaywrightError as exc:
+                    logger.debug(
+                        "Error interacting with dropdown trigger '%s': %s",
+                        selector,
+                        exc,
+                    )
+
+        return raw
 
     # ------------------------------------------------------------------
     # URL parameter extraction
