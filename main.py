@@ -213,6 +213,13 @@ Examples
         action="store_true",
         help="Enable DEBUG-level logging",
     )
+    out.add_argument(
+        "--log-level",
+        dest="log_level",
+        choices=["debug", "info", "warning", "error", "critical"],
+        default="error",
+        help="Set logging level (default: error)",
+    )
 
     # ── Browser ───────────────────────────────────────────────────────────────
     browser = parser.add_argument_group("browser")
@@ -422,7 +429,12 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Logging setup ─────────────────────────────────────────────────────────
-    log_level = logging.DEBUG if args.verbose else logging.ERROR
+    if args.verbose:
+        log_level = logging.DEBUG
+    else:
+        log_level = getattr(logging, args.log_level.upper(), logging.ERROR)
+
+
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
