@@ -388,8 +388,14 @@ async def run(args: argparse.Namespace) -> None:
                 "No pages discovered — check --base-url, --scope, and auth settings."
             )
 
-        await context.close()
-        await browser.close()
+        try:
+            await context.close()
+        except Exception:
+            pass
+        try:
+            await browser.close()
+        except Exception:
+            pass
 
     # ── Persist and summarise ─────────────────────────────────────────────────
     reporter.save()
