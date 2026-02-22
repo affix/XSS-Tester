@@ -1,0 +1,432 @@
+"""
+Spider/Spider.py — Async web crawler and input-discovery engine.
+
+Crawls from a base URL, stays within the target domain and optional scope
+path, waits for SPA network-idle states, and extracts:
+  - All HTML form inputs and standalone inputs
+  - URL parameters present in the page URL
+  - Outgoing links for further crawling
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Optional
+from urllib.parse import (
+    urljoin,
+    urlparse,
+    urlunparse,
+    parse_qs,
+    urlencode,
+)
+
+from playwright.async_api import BrowserContext, Error as PlaywrightError, Page
+
+from Auth import AuthManager
+from Models import InputField, PageData, UrlParam
+from Reporter import Reporter
+
+logger = logging.getLogger(__name__)
+
+# File extensions that will never contain HTML worth testing
+_SKIP_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
+        ".svg", ".ico", ".css", ".js", ".mjs", ".ts",
+        ".zip", ".tar", ".gz", ".rar", ".7z", ".bz2",
+        ".exe", ".dmg", ".pkg", ".deb", ".rpm", ".msi",
+        ".mp4", ".mp3", ".wav", ".avi", ".mov", ".mkv", ".webm",
+        ".woff", ".woff2", ".ttf", ".eot", ".otf",
+        ".xml", ".json", ".csv", ".xls", ".xlsx", ".doc", ".docx",
+        ".ppt", ".pptx",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Spider
+# ---------------------------------------------------------------------------
+
+
+class Spider:
+    """Async BFS web crawler.
+
+    Opens a new Playwright page for each URL, waits for ``networkidle``,
+    then extracts inputs and links before closing the page. Respects the
+    ``--max-pages`` and ``--max-depth`` limits. Concurrency is controlled
+    by the shared :class:`asyncio.Semaphore`.
+    """
+
+    def __init__(
+        self,
+        context: BrowserContext,
+        base_url: str,
+        scope: Optional[str],
+        max_pages: int,
+        max_depth: int,
+        delay: float,
+        semaphore: asyncio.Semaphore,
+        auth_manager: AuthManager,
+        reporter: Reporter,
+        shutdown_event: asyncio.Event,
+    ) -> None:
+        self.context = context
+        self.base_url = base_url.rstrip("/")
+        self.scope = scope
+        self.max_pages = max_pages
+        self.max_depth = max_depth
+        self.delay = delay
+        self.semaphore = semaphore
+        self.auth_manager = auth_manager
+        self.reporter = reporter
+        self.shutdown_event = shutdown_event
+
+        parsed = urlparse(base_url)
+        self.base_domain: str = parsed.netloc
+
+        self._visited: set[str] = set()
+        # BFS queue of (normalised_url, depth)
+        self._queue: list[tuple[str, int]] = []
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    async def crawl(self) -> list[PageData]:
+        """Crawl from :attr:`base_url` and return discovered :class:`PageData`.
+
+        Uses a simple BFS queue. Each URL is visited once; discovered links
+        are enqueued up to :attr:`max_depth`. Crawl stops when the queue is
+        empty, :attr:`max_pages` is reached, or a shutdown is requested.
+        """
+        self._queue.append((self.base_url, 0))
+        results: list[PageData] = []
+
+        while self._queue and not self.shutdown_event.is_set():
+            if len(self._visited) >= self.max_pages:
+                logger.info("max-pages limit (%d) reached", self.max_pages)
+                break
+
+            url, depth = self._queue.pop(0)
+            norm_url = self._normalize_url(url)
+
+            if not norm_url:
+                continue
+            if norm_url in self._visited:
+                continue
+            if not self._in_scope(norm_url):
+                continue
+            if self._should_skip(norm_url):
+                continue
+
+            self._visited.add(norm_url)
+
+            async with self.semaphore:
+                page_data = await self._visit_page(norm_url, depth)
+
+            if page_data is None:
+                continue
+
+            # Mark the final (post-redirect) URL as visited so a direct link
+            # to the redirected URL doesn't cause it to be crawled again.
+            norm_final = self._normalize_url(page_data.url)
+            if norm_final and norm_final != norm_url:
+                self._visited.add(norm_final)
+
+            results.append(page_data)
+            self.reporter.pages_crawled += 1
+            self.reporter.log_info(
+                f"Crawled [cyan]{page_data.url}[/cyan]  "
+                f"inputs=[yellow]{len(page_data.inputs)}[/yellow]  "
+                f"url-params=[yellow]{len(page_data.url_params)}[/yellow]  "
+                f"depth={depth}"
+            )
+
+            # Enqueue newly discovered links
+            if depth < self.max_depth:
+                for link_url in page_data.links:
+                    norm_link = self._normalize_url(link_url)
+                    if norm_link and norm_link not in self._visited:
+                        self._queue.append((norm_link, depth + 1))
+
+            if self.delay:
+                await asyncio.sleep(self.delay)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Page visit
+    # ------------------------------------------------------------------
+
+    async def _visit_page(self, url: str, depth: int) -> Optional[PageData]:
+        """Open *url* in a new page and extract all testable data.
+
+        Returns *None* on navigation error or non-HTML response.
+        """
+        page: Optional[Page] = None
+        try:
+            page = await self.context.new_page()
+
+            response = await page.goto(url, wait_until="networkidle", timeout=30_000)
+
+            # Detect session expiry (redirect to login page)
+            if self.auth_manager.is_login_page(page.url):
+                logger.info("Session expiry detected at %s — re-authenticating", url)
+                await page.close()
+                page = None
+                await self.auth_manager.re_authenticate(self.context)
+                page = await self.context.new_page()
+                response = await page.goto(url, wait_until="networkidle", timeout=30_000)
+
+            # Skip non-successful responses
+            if response and response.status >= 400:
+                logger.debug("HTTP %d for %s — skipping", response.status, url)
+                return None
+
+            # Verify we got HTML (skip e.g. JSON API responses the spider stumbled on)
+            content_type = ""
+            if response:
+                content_type = response.headers.get("content-type", "")
+            if content_type and "html" not in content_type.lower() and not content_type == "":
+                logger.debug("Non-HTML content-type '%s' for %s — skipping", content_type, url)
+                return None
+
+            final_url = page.url
+
+            # If the server redirected outside our target domain, skip
+            if not self._in_scope(final_url):
+                logger.debug(
+                    "Redirect left scope: %s -> %s — skipping", url, final_url
+                )
+                return None
+
+            if final_url != url:
+                logger.debug("Redirect followed: %s -> %s", url, final_url)
+
+            page_data = PageData(url=final_url, depth=depth)
+            page_data.inputs = await self._extract_inputs(page)
+            page_data.links = await self._extract_links(page)
+            # Use final_url so params added by the redirect (e.g. ?q=&tr=) are captured
+            page_data.url_params = self._extract_url_params(final_url, page_data.links)
+
+            return page_data
+
+        except PlaywrightError as exc:
+            logger.debug("Playwright error visiting %s: %s", url, exc)
+            return None
+        except Exception as exc:
+            logger.debug("Unexpected error visiting %s: %s", url, exc)
+            return None
+        finally:
+            if page and not page.is_closed():
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Input extraction
+    # ------------------------------------------------------------------
+
+    async def _extract_inputs(self, page: Page) -> list[InputField]:
+        """Return all testable ``<input>``, ``<textarea>``, and ``<select>`` elements.
+
+        Processes form-bound fields first, then standalone (orphaned) inputs.
+        """
+        inputs: list[InputField] = []
+        _skip_types = {"submit", "button", "reset", "image", "file", "hidden"}
+
+        try:
+            # ── Form-bound inputs ──────────────────────────────────────────
+            forms = await page.query_selector_all("form")
+            for form_idx, form in enumerate(forms):
+                # Build a reasonably unique selector for this form
+                form_id = await form.get_attribute("id")
+                form_sel = f"#{form_id}" if form_id else f"form:nth-of-type({form_idx + 1})"
+
+                raw_action = await form.get_attribute("action") or page.url
+                action = urljoin(page.url, raw_action)
+                method = (await form.get_attribute("method") or "GET").upper()
+
+                field_els = await form.query_selector_all(
+                    "input, textarea, select"
+                )
+                for el in field_els:
+                    tag = (await el.evaluate("e => e.tagName")).lower()
+                    itype = (await el.get_attribute("type") or "text").lower()
+                    if itype in _skip_types:
+                        continue
+
+                    name = await el.get_attribute("name")
+                    el_id = await el.get_attribute("id")
+                    selector = self._build_selector(tag, name, el_id, form_idx)
+
+                    inputs.append(
+                        InputField(
+                            selector=selector,
+                            name=name,
+                            input_type=itype if tag == "input" else tag,
+                            form_selector=form_sel,
+                            form_action=action,
+                            form_method=method,
+                        )
+                    )
+
+            # ── Standalone inputs (not inside any form) ────────────────────
+            orphan_els = await page.query_selector_all(
+                "input:not(form input), textarea:not(form textarea), select:not(form select)"
+            )
+            for el in orphan_els:
+                tag = (await el.evaluate("e => e.tagName")).lower()
+                itype = (await el.get_attribute("type") or "text").lower()
+                if itype in _skip_types:
+                    continue
+
+                name = await el.get_attribute("name")
+                el_id = await el.get_attribute("id")
+                selector = self._build_selector(tag, name, el_id, 0)
+
+                inputs.append(
+                    InputField(
+                        selector=selector,
+                        name=name,
+                        input_type=itype if tag == "input" else tag,
+                        form_selector=None,
+                        form_action=None,
+                        form_method="GET",
+                    )
+                )
+
+        except PlaywrightError as exc:
+            logger.debug("Error extracting inputs from page: %s", exc)
+
+        return inputs
+
+    # ------------------------------------------------------------------
+    # Link extraction
+    # ------------------------------------------------------------------
+
+    async def _extract_links(self, page: Page) -> list[str]:
+        """Return all in-scope, non-skippable absolute URLs from the page.
+
+        Collects links from ``<a href>``, ``<form action>``, and also looks
+        for JavaScript navigation patterns by evaluating anchor elements.
+        """
+        raw: list[str] = []
+        try:
+            # Anchor hrefs (browser resolves to absolute URLs via .href)
+            hrefs: list[str] = await page.eval_on_selector_all(
+                "a[href]", "els => els.map(e => e.href)"
+            )
+            raw.extend(hrefs)
+
+            # Form actions
+            actions: list[str] = await page.eval_on_selector_all(
+                "form[action]", "els => els.map(e => e.action)"
+            )
+            raw.extend(actions)
+
+        except PlaywrightError as exc:
+            logger.debug("Error extracting links: %s", exc)
+
+        links: list[str] = []
+        seen: set[str] = set()
+        for href in raw:
+            norm = self._normalize_url(href)
+            if norm and norm not in seen and self._in_scope(norm) and not self._should_skip(norm):
+                seen.add(norm)
+                links.append(norm)
+
+        return links
+
+    # ------------------------------------------------------------------
+    # URL parameter extraction
+    # ------------------------------------------------------------------
+
+    def _extract_url_params(
+        self, page_url: str, discovered_links: list[str]
+    ) -> list[UrlParam]:
+        """Return a ``UrlParam`` for every unique GET parameter found in *page_url*
+        and all *discovered_links*.
+
+        Scanning links as well as the page URL means GET parameters are
+        discovered even when the target page is never crawled (e.g. because
+        ``--max-pages`` or ``--max-depth`` limits were hit).
+
+        Deduplicates by ``(netloc + path, param_name)`` so the same parameter
+        on the same endpoint is only tested once regardless of how many
+        distinct link values were observed.
+        """
+        params: list[UrlParam] = []
+        seen: set[tuple[str, str]] = set()  # (netloc+path, param_name)
+
+        for url in [page_url, *discovered_links]:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            if not qs:
+                continue
+            endpoint_key = parsed.netloc + parsed.path
+            for name, values in qs.items():
+                key = (endpoint_key, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                params.append(
+                    UrlParam(
+                        url=url,
+                        param_name=name,
+                        original_value=values[0] if values else "",
+                    )
+                )
+
+        return params
+
+    # ------------------------------------------------------------------
+    # URL helpers
+    # ------------------------------------------------------------------
+
+    def _normalize_url(self, url: str) -> str:
+        """Return a canonical, fragment-free version of *url*, or ``""`` on failure."""
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"}:
+                return ""
+            return urlunparse(parsed._replace(fragment=""))
+        except Exception:
+            return ""
+
+    def _in_scope(self, url: str) -> bool:
+        """Return *True* if *url* is within the allowed domain and scope path."""
+        try:
+            parsed = urlparse(url)
+            if parsed.netloc != self.base_domain:
+                return False
+            if self.scope and not parsed.path.startswith(self.scope):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _should_skip(self, url: str) -> bool:
+        """Return *True* if the URL points to a non-HTML resource."""
+        try:
+            path = urlparse(url).path.lower()
+            _, dot, ext = path.rpartition(".")
+            return bool(dot) and f".{ext}" in _SKIP_EXTENSIONS
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Miscellaneous helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_selector(tag: str, name: Optional[str], el_id: Optional[str], idx: int) -> str:
+        """Build the most specific CSS selector available for an element."""
+        if el_id:
+            return f"#{el_id}"
+        if name:
+            return f"{tag}[name='{name}']"
+        return f"{tag}:nth-of-type({idx + 1})"

