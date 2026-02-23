@@ -441,12 +441,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
         handlers=[logging.StreamHandler(sys.stderr)],
     )
-
-    # Suppress noisy library logs unless in verbose mode
-    if not args.verbose:
-        for lib in ("playwright", "httpx", "asyncio"):
-            logging.getLogger(lib).setLevel(logging.WARNING)
-
+    
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
